@@ -2,8 +2,8 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRHandModelFactory } from 'three/addons/webxr/XRHandModelFactory.js';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
-import { ClayField } from './sdf.js?v=0.3.0';
-import { ButtonPanel } from './panel.js?v=0.3.0';
+import { ClayField } from './sdf.js?v=0.4.0';
+import { ButtonPanel } from './panel.js?v=0.4.0';
 
 // ================= 設定 =================
 const CLAY_HOME = new THREE.Vector3(0, 1.1, -0.45);
@@ -328,20 +328,34 @@ const JOINT_NAMES = [...new Set(BONES.flatMap(([a, b]) => [a, b]))];
 // 粘性: 手が動いた量のうち、粘土が付いてくる割合
 const VISC = {
   F: 0.012,      // 手の表面からどこまで粘土が引きずられるか (m)
-  push: 0.8,     // 押し込む向き
+  push: 0.25,    // 押し込む向き (小さいほど硬い。足りない分は下の LIMIT.pressure でゆっくり流れる)
   slide: 0.45,   // 表面に沿ってなでる向き
   stick: 0.25,   // 手を離す向き (少しだけ引っ張られる)
   maxStep: 0.012, // 1フレームで動かす上限 (m)
 };
 
+// 押し込みの制限 (タッチリミッティング / 疑似触覚)
+// 本物の手が粘土にめり込んでも、見えている手は表面近くで徐々に止まる。
+// 見えている手との差 (押し込み過ぎた分) は「押す力」として、粘土をゆっくり流れさせる。
+const LIMIT = {
+  depth: 0.012,   // 見えている手がめり込める深さの上限 (m)。浅いほど硬く感じる
+  pressure: 1.0,  // 押し込み過ぎた分 1m あたり、毎秒どれだけ粘土を流すか (1/s)。大きいほど早く沈む
+  follow: 25,     // 見えている手が目標に追いつく速さ (1/s)
+  release: 10,    // 離したとき見えている手が本物の手に戻る速さ (1/s)
+};
+
 const handFactory = new XRHandModelFactory();
 const hands = [0, 1].map((i) => {
   const hand = renderer.xr.getHand(i);
+  // 見えている手 (表面で止まる) と、本物の手の位置を薄く示すゴースト
   const model = handFactory.createHandModel(hand, 'mesh');
-  hand.add(model);
+  const ghost = handFactory.createHandModel(hand, 'mesh');
+  hand.add(model, ghost);
   scene.add(hand);
   const hs = {
-    hand, model, connected: false, handedness: null,
+    hand, model, ghost, connected: false, handedness: null,
+    offset: new THREE.Vector3(), n: new THREE.Vector3(0, 1, 0), s: 0, excess: 0, styled: false,
+    jreal: new Map(JOINT_NAMES.map((n) => [n, new THREE.Vector3()])),
     tipF: new OneEuro3(), pinchF: new OneEuro3(),
     tip: new THREE.Vector3(), pinchPos: new THREE.Vector3(),
     pinching: false, pinchMode: null, lastG: new THREE.Vector3(), grabOffset: new THREE.Vector3(),
@@ -356,7 +370,7 @@ const hands = [0, 1].map((i) => {
   hand.addEventListener('connected', (e) => { hs.connected = true; hs.handedness = e.data.handedness; });
   hand.addEventListener('disconnected', () => {
     hs.connected = false; endPinch(hs); hs.touching = false; hs.contact = false;
-    hs.cursor.visible = false; hs.prevValid.clear();
+    hs.cursor.visible = false; hs.prevValid.clear(); hs.offset.set(0, 0, 0); hs.excess = 0; hs.s = 0;
   });
   return hs;
 });
@@ -428,8 +442,78 @@ function readJoints(hs, t) {
     const j = hs.hand.joints[name];
     if (!j || !j.visible) continue;
     j.getWorldPosition(_tipRaw);
-    hs.jpos.get(name).copy(hs.jointF.get(name).filter(_tipRaw, t));
+    hs.jreal.get(name).copy(hs.jointF.get(name).filter(_tipRaw, t));
     hs.valid.add(name);
+  }
+}
+
+// 見えている手 (プロキシ) のずらし量を決める。
+// 粘土の内部の距離はくずれやすいので、表面近くにいる「見えている手」のめり込みだけを測り、
+// 本物の手の深さ = 見えている手のめり込み + これまでのずらし量 として扱う (god-object 方式)
+const _lg = new THREE.Vector3(), _ln = new THREE.Vector3(), _lp = new THREE.Vector3();
+function updateTouchLimit(hs, dt, active) {
+  let best = -Infinity;
+  if (active) {
+    for (const [a, b, rFixed] of BONES) {
+      if (!hs.valid.has(a) || !hs.valid.has(b)) continue;
+      const r = worldLenToGrid(rFixed || FINGER_R);
+      const pa = hs.jreal.get(a), pb = hs.jreal.get(b);
+      for (const k of [0, 0.5, 1]) {
+        _lp.lerpVectors(pa, pb, k).add(hs.offset);
+        const g = worldToGrid(_lp, _lg);
+        const depth = r - field.sample(g); // 格子単位。正ならめり込み、負なら表面までのすき間
+        if (depth > best) {
+          best = depth;
+          if (depth > -2) field.gradient(g, _ln);
+        }
+      }
+    }
+  }
+  let sTarget = 0;
+  if (best > -Infinity) {
+    const proxyDepth = best * field.h * clay.scale.x; // m
+    if (proxyDepth > -0.005) {
+      // 押す向き (粘土の外向き) をなめらかに追う
+      _ln.applyQuaternion(clay.quaternion);
+      if (hs.s <= 1e-4) hs.n.copy(_ln); else hs.n.lerp(_ln, 0.15).normalize();
+    }
+    const D = Math.max(0, proxyDepth + hs.s); // 本物の手のめり込み
+    // 見せるめり込み = L(1 - e^(-D/L)): 浅いうちはほぼそのまま、深いほど止まる
+    const L = LIMIT.depth;
+    sTarget = D - L * (1 - Math.exp(-D / L));
+  }
+  const rate = sTarget > hs.s ? LIMIT.follow : LIMIT.release;
+  hs.s += (sTarget - hs.s) * (1 - Math.exp(-rate * dt));
+  if (hs.s < 1e-5) hs.s = 0;
+  hs.excess = hs.s;
+  hs.offset.copy(hs.n).multiplyScalar(hs.s);
+  for (const name of hs.valid) hs.jpos.get(name).copy(hs.jreal.get(name)).add(hs.offset);
+}
+
+// 手のモデルの見た目: 見えている手はずらした位置に、ゴーストは本物の位置に
+const handMat = new THREE.MeshStandardMaterial({ color: 0xe3c4b3, roughness: 0.55, transparent: true });
+const ghostMat = new THREE.MeshBasicMaterial({ color: 0x9fd3ff, transparent: true, opacity: 0, depthTest: false, depthWrite: false });
+function updateHandVisuals(hs) {
+  if (!hs.styled) {
+    const m = hs.model.getObjectByProperty('type', 'SkinnedMesh');
+    const g = hs.ghost.getObjectByProperty('type', 'SkinnedMesh');
+    if (m && g) {
+      m.material = handMat.clone();
+      g.material = ghostMat.clone();
+      g.renderOrder = 50;
+      hs.styled = true;
+    }
+  }
+  const off = hs.offset.length();
+  hs.model.position.copy(hs.offset);
+  const ar = xrMode === 'immersive-ar';
+  // パススルーでは本物の手が見えているので、ずれた時だけ見えている手を出す
+  const handOpacity = ar ? THREE.MathUtils.smoothstep(off, 0.003, 0.01) : 1;
+  hs.model.visible = handOpacity > 0.01;
+  hs.ghost.visible = !ar && off > 0.004;
+  if (hs.styled) {
+    hs.model.getObjectByProperty('type', 'SkinnedMesh').material.opacity = handOpacity;
+    hs.ghost.getObjectByProperty('type', 'SkinnedMesh').material.opacity = THREE.MathUtils.smoothstep(off, 0.004, 0.02) * 0.3;
   }
 }
 function rememberJoints(hs) {
@@ -442,7 +526,7 @@ function rememberJoints(hs) {
 
 // 手のカプセルを格子座標にして、粘土に近いものだけ返す
 const _gm = new THREE.Vector3(), _n = new THREE.Vector3(), _u = new THREE.Vector3();
-function handCapsules(hs) {
+function handCapsules(hs, dt = 1 / 72) {
   const caps = [];
   let contact = false;
   const F = worldLenToGrid(VISC.F);
@@ -471,8 +555,13 @@ function handCapsules(hs) {
       const un = _u.dot(_n);
       _u.addScaledVector(_n, -un).multiplyScalar(VISC.slide)
         .addScaledVector(_n, un * (un > 0 ? VISC.stick : VISC.push));
-      if (_u.length() > maxStep) _u.setLength(maxStep);
     }
+    // 押し込み過ぎた分は「押す力」: 触れている所の粘土を内側へゆっくり流す
+    if (hs.excess > 0 && sMin < r) {
+      field.gradient(_gm, _n);
+      _u.addScaledVector(_n, -LIMIT.pressure * worldLenToGrid(hs.excess) * dt);
+    }
+    if (_u.length() > maxStep) _u.setLength(maxStep);
     caps.push({ ax: ga.x, ay: ga.y, az: ga.z, bx: gb.x, by: gb.y, bz: gb.z, r, ux: _u.x, uy: _u.y, uz: _u.z });
   }
   return { caps, contact, F };
@@ -480,7 +569,7 @@ function handCapsules(hs) {
 
 // 手のひら全体でこねる / なでる
 function handSculpt(hs, dt, t) {
-  const { caps, contact, F } = handCapsules(hs);
+  const { caps, contact, F } = handCapsules(hs, dt);
   if (contact) {
     if (!hs.contact) { pushUndo(); hs.contact = true; }
     hs.lastContactT = t;
@@ -514,9 +603,13 @@ function updateXR(dt, t) {
       hs.touching = false;
       hs.contact = false;
       hs.prevValid.clear();
+      hs.offset.set(0, 0, 0);
+      hs.excess = 0;
+      hs.s = 0;
       continue;
     }
     readJoints(hs, t);
+    updateTouchLimit(hs, dt, !hs.pinching && (state.mode === 'knead' || state.mode === 'smooth'));
     tipJ.getWorldPosition(_tipRaw);
     thumbJ.getWorldPosition(_thumbRaw);
     hs.tip.copy(hs.tipF.filter(_tipRaw, t));
@@ -564,6 +657,7 @@ function updateXR(dt, t) {
     }
     rememberJoints(hs);
   }
+  for (const hs of hands) updateHandVisuals(hs);
   updateObjectManip(movers);
 }
 
@@ -617,7 +711,7 @@ let recenterPending = false;
 let xrStartT = 0;
 
 // ---- 状態表示 (画面の UI と、XR 中は目の前の文字板) ----
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 const logLines = [];
 function log(msg) {
   const line = `${new Date().toLocaleTimeString()} ${msg}`;
@@ -672,7 +766,7 @@ function applyEnvironment() {
   const ar = xrMode === 'immersive-ar';
   scene.background = ar ? null : BG;
   floor.visible = !ar;
-  for (const hs of hands) hs.model.visible = !ar; // パススルーでは本物の手が見える
+  for (const hs of hands) { hs.offset.set(0, 0, 0); hs.s = 0; } // 手の見え方は updateHandVisuals で毎フレーム決める
   panel.group.visible = !!xrMode;
   bounds.visible = !xrMode;
   desktopCursor.visible = false;
@@ -842,4 +936,4 @@ renderer.setAnimationLoop((tms, frame) => {
 document.getElementById('ver').textContent = `v${VERSION}`;
 
 // デバッグ用
-window.__clay = { field, clay, state, setMode, setBrush, undo, applyTool, chunkMeshes, camera, controls, hands, updateXR, panel, workspace, undoStack, recenterFrom, tryRecenterFromFrame, log, hud };
+window.__clay = { field, clay, state, setMode, setBrush, undo, applyTool, chunkMeshes, camera, controls, hands, updateXR, panel, workspace, undoStack, recenterFrom, tryRecenterFromFrame, log, hud, LIMIT, VISC };
