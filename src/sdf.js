@@ -23,6 +23,9 @@ export class ClayField {
     this.d = new Float32Array(total);
     this.tmp = new Float32Array(total);
     this.dirty = new Set();
+    this.conserveBand = 6;   // 押しのけた分を盛り上げる帯の幅 (格子)
+    this.conserveMax = 1.0;  // 1回で盛り上げる上限 (格子)
+    this.relax = 0.15;       // 手が触れた所をなじませる強さ (0〜1)
 
     const L = chunk + 1;
     this._L = L;
@@ -255,6 +258,164 @@ export class ClayField {
     }
     if (any) this.markDirtyPoints(x0, x1, y0, y1, z0, z1);
     return any;
+  }
+
+  // 手で押しのける (粘性のある変形)
+  // caps: [{ ax, ay, az, bx, by, bz, r, ux, uy, uz }] 格子座標のカプセルと、このフレームの移動量 u
+  // カプセルの中と、その周り F までの粘土を u だけ動かす (中ほど強く、外側ほど弱く)
+  // conserve: 押しのけて減った分を、手の縁のまわりの表面に盛り上げて戻す (粘土らしい体積の保存)
+  displace(caps, F, conserve = true) {
+    if (!caps.length) return false;
+    const { N, d } = this;
+    const NN = N * N;
+    if (!this._uw) {
+      const total = N * N * N;
+      this._ux = new Float32Array(total);
+      this._uy = new Float32Array(total);
+      this._uz = new Float32Array(total);
+      this._uw = new Float32Array(total);
+      this._touch = new Int32Array(total);
+      this._sh = new Uint8Array(total);
+      this._shell = new Int32Array(total);
+    }
+    const ux = this._ux, uy = this._uy, uz = this._uz, uw = this._uw, touch = this._touch;
+    const sh = this._sh, shell = this._shell;
+    const B = conserve ? this.conserveBand : 0; // 盛り上げる帯の幅 (格子)
+    let nt = 0, ns = 0, maxU = 0;
+    let gx0 = Infinity, gx1 = -Infinity, gy0 = Infinity, gy1 = -Infinity, gz0 = Infinity, gz1 = -Infinity;
+
+    for (const c of caps) {
+      const R = c.r + F + B;
+      const x0 = Math.max(1, Math.floor(Math.min(c.ax, c.bx) - R)), x1 = Math.min(N - 2, Math.ceil(Math.max(c.ax, c.bx) + R));
+      const y0 = Math.max(1, Math.floor(Math.min(c.ay, c.by) - R)), y1 = Math.min(N - 2, Math.ceil(Math.max(c.ay, c.by) + R));
+      const z0 = Math.max(1, Math.floor(Math.min(c.az, c.bz) - R)), z1 = Math.min(N - 2, Math.ceil(Math.max(c.az, c.bz) + R));
+      if (x0 > x1 || y0 > y1 || z0 > z1) continue;
+      gx0 = Math.min(gx0, x0); gx1 = Math.max(gx1, x1);
+      gy0 = Math.min(gy0, y0); gy1 = Math.max(gy1, y1);
+      gz0 = Math.min(gz0, z0); gz1 = Math.max(gz1, z1);
+      maxU = Math.max(maxU, Math.hypot(c.ux, c.uy, c.uz));
+      const ex = c.bx - c.ax, ey = c.by - c.ay, ez = c.bz - c.az;
+      const ee = ex * ex + ey * ey + ez * ez || 1e-9;
+      const coreR2 = (c.r + F) * (c.r + F), shellR2 = (c.r + F + B) * (c.r + F + B);
+      for (let z = z0; z <= z1; z++) {
+        for (let y = y0; y <= y1; y++) {
+          let i = x0 + N * y + NN * z;
+          for (let x = x0; x <= x1; x++, i++) {
+            const px = x - c.ax, py = y - c.ay, pz = z - c.az;
+            let t = (px * ex + py * ey + pz * ez) / ee;
+            t = t < 0 ? 0 : t > 1 ? 1 : t;
+            const qx = px - t * ex, qy = py - t * ey, qz = pz - t * ez;
+            const q2 = qx * qx + qy * qy + qz * qz;
+            if (q2 >= coreR2) {
+              // 帯: 表面の近くだけ見ればよい
+              if (q2 < shellR2 && d[i] > -1 && d[i] < 2 && !sh[i]) { sh[i] = 1; shell[ns++] = i; }
+              continue;
+            }
+            const sd = Math.sqrt(q2) - c.r;
+            let w = 1;
+            if (sd > 0) { const s = sd / F; w = (1 - s * s) * (1 - s * s); }
+            if (uw[i] === 0) touch[nt++] = i;
+            if (w > uw[i]) { uw[i] = w; ux[i] = c.ux; uy[i] = c.uy; uz[i] = c.uz; }
+          }
+        }
+      }
+    }
+    if (!nt) {
+      for (let k = 0; k < ns; k++) sh[shell[k]] = 0;
+      return false;
+    }
+    // 別のカプセルの内側に入っている点は帯から外す
+    let nk = 0;
+    for (let k = 0; k < ns; k++) {
+      const i = shell[k];
+      sh[i] = 0;
+      if (uw[i] === 0) shell[nk++] = i;
+    }
+
+    // 動かす前の値を tmp に写してから、そこを引いて読む
+    const m = maxU + 2;
+    this._copyBox(gx0 - m, gx1 + m, gy0 - m, gy1 + m, gz0 - m, gz1 + m);
+    const tmp = this.tmp;
+    let bx0 = Infinity, bx1 = -1, by0 = Infinity, by1 = -1, bz0 = Infinity, bz1 = -1;
+    const occ = (v) => (v <= -0.5 ? 1 : v >= 0.5 ? 0 : 0.5 - v);
+    let lost = 0;
+    for (let k = 0; k < nt; k++) {
+      const i = touch[k];
+      const w = uw[i];
+      uw[i] = 0;
+      const x = i % N, y = ((i / N) | 0) % N, z = (i / NN) | 0;
+      const v = this._tri(tmp, x - w * ux[i], y - w * uy[i], z - w * uz[i]);
+      if (Math.abs(v - d[i]) > 1e-5) {
+        lost += occ(d[i]) - occ(v);
+        d[i] = v;
+        if (x < bx0) bx0 = x; if (x > bx1) bx1 = x;
+        if (y < by0) by0 = y; if (y > by1) by1 = y;
+        if (z < bz0) bz0 = z; if (z > bz1) bz1 = z;
+      }
+    }
+
+    // 減った体積を、手の縁の表面を少し外へ押し出して戻す。
+    // 一度に大きく押し出すと戻る量が頭打ちになるので、実際に戻った量を測りながら数回に分ける
+    let remaining = lost;
+    for (let iter = 0; iter < 4 && remaining > 0.5 && nk; iter++) {
+      let A = 0;
+      for (let k = 0; k < nk; k++) {
+        const v = d[shell[k]];
+        if (v > -0.5 && v < 1.5) A += 1 - Math.abs(v - 0.5) / 1.5;
+      }
+      if (A <= 0) break;
+      const delta = Math.min(remaining / A, this.conserveMax);
+      let gained = 0;
+      for (let k = 0; k < nk; k++) {
+        const i = shell[k];
+        const v = d[i];
+        const a = 1 - Math.abs(v - 0.5) / 1.5;
+        if (a <= 0) continue;
+        const nv = v - delta * a;
+        gained += occ(nv) - occ(v);
+        d[i] = nv;
+        const x = i % N, y = ((i / N) | 0) % N, z = (i / NN) | 0;
+        if (x < bx0) bx0 = x; if (x > bx1) bx1 = x;
+        if (y < by0) by0 = y; if (y > by1) by1 = y;
+        if (z < bz0) bz0 = z; if (z > bz1) bz1 = z;
+      }
+      remaining -= gained;
+      if (gained < 0.1) break;
+    }
+    if (bx1 < 0) return false;
+
+    // なじませる: 手が触れた所と縁を、まわりの平均へ少し寄せる (筋やギザギザを消し、柔らかく見せる)
+    if (this.relax > 0) {
+      this._copyBox(bx0 - 1, bx1 + 1, by0 - 1, by1 + 1, bz0 - 1, bz1 + 1);
+      const r = this.relax;
+      const lists = [[touch, nt], [shell, nk]];
+      for (const [list, n] of lists) {
+        for (let k = 0; k < n; k++) {
+          const i = list[k];
+          const v = tmp[i];
+          if (v > 3 || v < -3) continue; // 表面から遠い所は触らない
+          const x = i % N, y = ((i / N) | 0) % N, z = (i / NN) | 0;
+          if (x < bx0 || x > bx1 || y < by0 || y > by1 || z < bz0 || z > bz1) continue;
+          const avg = (tmp[i - 1] + tmp[i + 1] + tmp[i - N] + tmp[i + N] + tmp[i - NN] + tmp[i + NN]) / 6;
+          d[i] = v + (avg - v) * r;
+        }
+      }
+    }
+    this.markDirtyPoints(bx0, bx1, by0, by1, bz0, bz1);
+    return true;
+  }
+
+  _copyBox(xa, xb, ya, yb, za, zb) {
+    const N = this.N;
+    xa = Math.max(0, Math.floor(xa)); xb = Math.min(N - 1, Math.ceil(xb));
+    ya = Math.max(0, Math.floor(ya)); yb = Math.min(N - 1, Math.ceil(yb));
+    za = Math.max(0, Math.floor(za)); zb = Math.min(N - 1, Math.ceil(zb));
+    for (let z = za; z <= zb; z++) {
+      for (let y = ya; y <= yb; y++) {
+        const row = N * (y + N * z);
+        this.tmp.set(this.d.subarray(row + xa, row + xb + 1), row + xa);
+      }
+    }
   }
 
   // ---------- Undo ----------

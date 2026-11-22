@@ -2,18 +2,18 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRHandModelFactory } from 'three/addons/webxr/XRHandModelFactory.js';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
-import { ClayField } from './sdf.js';
-import { ButtonPanel } from './panel.js';
+import { ClayField } from './sdf.js?v=0.3.0';
+import { ButtonPanel } from './panel.js?v=0.3.0';
 
 // ================= 設定 =================
 const CLAY_HOME = new THREE.Vector3(0, 1.1, -0.45);
 const MODES = {
-  carve: { label: '押す', color: '#4fc3f7' },
+  knead: { label: 'こねる', color: '#4fc3f7' },
   add: { label: '盛る', color: '#81c784' },
   smooth: { label: 'なでる', color: '#ffd54f' },
   pull: { label: 'つまむ', color: '#ff8a65' }, // デスクトップ用 (XR ではピンチが常に「つまむ」)
 };
-const state = { mode: 'carve', brushR: 0.015 };
+const state = { mode: 'knead', brushR: 0.015 };
 const grabR = () => state.brushR * 2.2;
 const PINCH_ON = 0.02, PINCH_OFF = 0.04, PRE_PINCH = 0.05; // m
 
@@ -109,10 +109,14 @@ function gridToWorld(g, out = new THREE.Vector3()) {
 }
 const worldLenToGrid = (len) => len / (field.h * clay.scale.x);
 
-function applyTool(mode, worldPos, strength = 0.5) {
+function applyTool(mode, worldPos, strength = 0.5, dir = null) {
   const g = worldToGrid(worldPos, _w);
   const r = worldLenToGrid(state.brushR);
-  if (mode === 'carve') return field.carve(g, r);
+  if (mode === 'knead' && dir) {
+    // デスクトップのこねる: 押した向きに粘土を押しのける (削らずに動かす)
+    const g2 = worldToGrid(new THREE.Vector3().copy(worldPos).addScaledVector(dir, state.brushR * 0.3));
+    return field.pull(g, g2.sub(g), r * 1.6);
+  }
   if (mode === 'add') return field.add(g, r);
   if (mode === 'smooth') return field.smooth(g, r * 1.4, strength);
   return false;
@@ -202,10 +206,10 @@ function applyDesktopStroke(ray, first) {
   const hit = raymarchWorld(ray, arr);
   if (!hit) return;
   const center = hit.clone();
-  if (m === 'carve') center.addScaledVector(ray.direction, state.brushR * 0.35);
+  if (m === 'knead') center.addScaledVector(ray.direction, state.brushR * 0.3);
   showCursor(desktopCursor, hit, state.brushR, MODES[m].color, 0.25);
   if (first || m === 'smooth') {
-    applyTool(m, center, 0.5);
+    applyTool(m, center, 0.5, ray.direction);
     stroke.lastC = center.clone();
     return;
   }
@@ -214,7 +218,7 @@ function applyDesktopStroke(ray, first) {
   if (dist < step) return;
   const n = Math.ceil(dist / step);
   const p = new THREE.Vector3();
-  for (let i = 1; i <= n; i++) applyTool(m, p.lerpVectors(stroke.lastC, center, i / n));
+  for (let i = 1; i <= n; i++) applyTool(m, p.lerpVectors(stroke.lastC, center, i / n), 0.5, ray.direction);
   stroke.lastC.copy(center);
 }
 
@@ -298,10 +302,42 @@ class OneEuro3 {
   }
 }
 
+// ---- 手の形: 骨ごとのカプセルで手のひら全体を表す ----
+const FINGERS = ['index-finger', 'middle-finger', 'ring-finger', 'pinky-finger'];
+const PALM_R = 0.014, FINGER_R = 0.009; // m (0 = 関節の半径を使う)
+const BONES = [];
+for (const f of FINGERS) {
+  BONES.push(
+    ['wrist', `${f}-phalanx-proximal`, PALM_R],
+    [`${f}-phalanx-proximal`, `${f}-phalanx-intermediate`, 0],
+    [`${f}-phalanx-intermediate`, `${f}-phalanx-distal`, 0],
+    [`${f}-phalanx-distal`, `${f}-tip`, 0],
+  );
+}
+BONES.push(
+  ['wrist', 'thumb-metacarpal', PALM_R],
+  ['thumb-metacarpal', 'thumb-phalanx-proximal', 0],
+  ['thumb-phalanx-proximal', 'thumb-phalanx-distal', 0],
+  ['thumb-phalanx-distal', 'thumb-tip', 0],
+  ['thumb-metacarpal', 'index-finger-phalanx-proximal', PALM_R], // 親指の付け根のふくらみ
+  ['index-finger-phalanx-proximal', 'pinky-finger-phalanx-proximal', PALM_R], // 指の付け根の列
+  ['index-finger-metacarpal', 'pinky-finger-metacarpal', PALM_R], // 手のひらの中ほど
+);
+const JOINT_NAMES = [...new Set(BONES.flatMap(([a, b]) => [a, b]))];
+
+// 粘性: 手が動いた量のうち、粘土が付いてくる割合
+const VISC = {
+  F: 0.012,      // 手の表面からどこまで粘土が引きずられるか (m)
+  push: 0.8,     // 押し込む向き
+  slide: 0.45,   // 表面に沿ってなでる向き
+  stick: 0.25,   // 手を離す向き (少しだけ引っ張られる)
+  maxStep: 0.012, // 1フレームで動かす上限 (m)
+};
+
 const handFactory = new XRHandModelFactory();
 const hands = [0, 1].map((i) => {
   const hand = renderer.xr.getHand(i);
-  const model = handFactory.createHandModel(hand, 'spheres');
+  const model = handFactory.createHandModel(hand, 'mesh');
   hand.add(model);
   scene.add(hand);
   const hs = {
@@ -309,12 +345,19 @@ const hands = [0, 1].map((i) => {
     tipF: new OneEuro3(), pinchF: new OneEuro3(),
     tip: new THREE.Vector3(), pinchPos: new THREE.Vector3(),
     pinching: false, pinchMode: null, lastG: new THREE.Vector3(), grabOffset: new THREE.Vector3(),
-    toolCenter: new THREE.Vector3(),
     touching: false, pressed: null,
+    jointF: new Map(JOINT_NAMES.map((n) => [n, new OneEuro3()])),
+    jpos: new Map(JOINT_NAMES.map((n) => [n, new THREE.Vector3()])),
+    jprev: new Map(JOINT_NAMES.map((n) => [n, new THREE.Vector3()])),
+    valid: new Set(), prevValid: new Set(),
+    contact: false, lastContactT: 0,
     cursor: makeCursor(),
   };
   hand.addEventListener('connected', (e) => { hs.connected = true; hs.handedness = e.data.handedness; });
-  hand.addEventListener('disconnected', () => { hs.connected = false; endPinch(hs); hs.touching = false; hs.cursor.visible = false; });
+  hand.addEventListener('disconnected', () => {
+    hs.connected = false; endPinch(hs); hs.touching = false; hs.contact = false;
+    hs.cursor.visible = false; hs.prevValid.clear();
+  });
   return hs;
 });
 
@@ -378,6 +421,85 @@ function updateObjectManip(movers) {
   clay.updateMatrixWorld();
 }
 
+// 関節の位置を読み、震えを抑える
+function readJoints(hs, t) {
+  hs.valid.clear();
+  for (const name of JOINT_NAMES) {
+    const j = hs.hand.joints[name];
+    if (!j || !j.visible) continue;
+    j.getWorldPosition(_tipRaw);
+    hs.jpos.get(name).copy(hs.jointF.get(name).filter(_tipRaw, t));
+    hs.valid.add(name);
+  }
+}
+function rememberJoints(hs) {
+  hs.prevValid.clear();
+  for (const name of hs.valid) {
+    hs.jprev.get(name).copy(hs.jpos.get(name));
+    hs.prevValid.add(name);
+  }
+}
+
+// 手のカプセルを格子座標にして、粘土に近いものだけ返す
+const _gm = new THREE.Vector3(), _n = new THREE.Vector3(), _u = new THREE.Vector3();
+function handCapsules(hs) {
+  const caps = [];
+  let contact = false;
+  const F = worldLenToGrid(VISC.F);
+  const maxStep = worldLenToGrid(VISC.maxStep);
+  for (const [a, b, rFixed] of BONES) {
+    if (!hs.valid.has(a) || !hs.valid.has(b)) continue;
+    let rw = rFixed;
+    if (!rw) {
+      const ra = hs.hand.joints[a].jointRadius, rb = hs.hand.joints[b].jointRadius;
+      rw = ra && rb ? (ra + rb) / 2 : FINGER_R;
+    }
+    const r = worldLenToGrid(rw);
+    const ga = worldToGrid(hs.jpos.get(a)), gb = worldToGrid(hs.jpos.get(b));
+    _gm.addVectors(ga, gb).multiplyScalar(0.5);
+    const sMin = Math.min(field.sample(ga), field.sample(gb), field.sample(_gm));
+    if (sMin > r + F + ga.distanceTo(gb) * 0.25) continue;
+    if (sMin < r) contact = true;
+
+    // このフレームの手の動き (両端の平均)
+    _u.set(0, 0, 0);
+    if (hs.prevValid.has(a) && hs.prevValid.has(b)) {
+      const qa = worldToGrid(hs.jprev.get(a)), qb = worldToGrid(hs.jprev.get(b));
+      _u.set((ga.x - qa.x + gb.x - qb.x) / 2, (ga.y - qa.y + gb.y - qb.y) / 2, (ga.z - qa.z + gb.z - qb.z) / 2);
+      // 粘性: 押し込む向きはよく付いてくる、横はやや遅れる、離す向きは少しだけ引っ張られる
+      field.gradient(_gm, _n);
+      const un = _u.dot(_n);
+      _u.addScaledVector(_n, -un).multiplyScalar(VISC.slide)
+        .addScaledVector(_n, un * (un > 0 ? VISC.stick : VISC.push));
+      if (_u.length() > maxStep) _u.setLength(maxStep);
+    }
+    caps.push({ ax: ga.x, ay: ga.y, az: ga.z, bx: gb.x, by: gb.y, bz: gb.z, r, ux: _u.x, uy: _u.y, uz: _u.z });
+  }
+  return { caps, contact, F };
+}
+
+// 手のひら全体でこねる / なでる
+function handSculpt(hs, dt, t) {
+  const { caps, contact, F } = handCapsules(hs);
+  if (contact) {
+    if (!hs.contact) { pushUndo(); hs.contact = true; }
+    hs.lastContactT = t;
+  } else if (hs.contact && t - hs.lastContactT > 0.3) {
+    hs.contact = false;
+  }
+  if (!caps.length) return;
+  if (state.mode === 'knead') {
+    const moving = caps.filter((c) => Math.hypot(c.ux, c.uy, c.uz) > 0.01);
+    field.displace(moving, F);
+  } else if (state.mode === 'smooth' && contact) {
+    for (const c of caps) {
+      const R = c.r + F;
+      field.smooth({ x: (c.ax + c.bx) / 2, y: (c.ay + c.by) / 2, z: (c.az + c.bz) / 2 }, R, dt * 5);
+      field.smooth({ x: c.bx, y: c.by, z: c.bz }, R, dt * 5);
+    }
+  }
+}
+
 const _tipRaw = new THREE.Vector3(), _thumbRaw = new THREE.Vector3(), _mid = new THREE.Vector3();
 
 function updateXR(dt, t) {
@@ -390,18 +512,22 @@ function updateXR(dt, t) {
       hs.cursor.visible = false;
       endPinch(hs);
       hs.touching = false;
+      hs.contact = false;
+      hs.prevValid.clear();
       continue;
     }
+    readJoints(hs, t);
     tipJ.getWorldPosition(_tipRaw);
     thumbJ.getWorldPosition(_thumbRaw);
     hs.tip.copy(hs.tipF.filter(_tipRaw, t));
     _mid.addVectors(_tipRaw, _thumbRaw).multiplyScalar(0.5);
     hs.pinchPos.copy(hs.pinchF.filter(_mid, t));
     const pinchDist = _tipRaw.distanceTo(_thumbRaw);
+    hs.cursor.visible = false;
 
     // ボタン
     if (!hs.pinching && panel.press(hs.tip, hs)) {
-      hs.cursor.visible = false;
+      rememberJoints(hs);
       continue;
     }
 
@@ -414,35 +540,29 @@ function updateXR(dt, t) {
         const g = worldToGrid(_w.addVectors(hs.pinchPos, hs.grabOffset));
         pullBetween(hs.lastG, g);
         hs.lastG.copy(g);
-        showCursor(hs.cursor, hs.pinchPos, grabR(), MODES.pull.color, 0.35);
       } else {
         movers.push(hs);
-        showCursor(hs.cursor, hs.pinchPos, 0.008, '#ffffff', 0.6);
       }
+      rememberJoints(hs);
       continue;
     }
 
-    // 指先の道具。指を閉じかけている間 (つまもうとしている) は使わない
-    const tool = MODES[state.mode] && state.mode !== 'pull' ? state.mode : null;
-    const allowed = tool && pinchDist > PRE_PINCH;
-    const r = worldLenToGrid(state.brushR);
-    // 押す: ブラシ球を指の腹の側に置き、指先が表面に触れたときだけ削れるようにする
-    const center = hs.toolCenter.copy(hs.tip);
-    const distalJ = hs.hand.joints['index-finger-phalanx-distal'];
-    if (tool === 'carve' && distalJ && distalJ.visible) {
-      const dir = distalJ.getWorldPosition(_thumbRaw).sub(_tipRaw).normalize(); // 指先 → 根元
-      center.addScaledVector(dir, state.brushR * 0.7);
+    if (state.mode === 'add') {
+      // 盛る: 人差し指の先から粘土を足す。指を閉じかけている間は止める
+      const allowed = pinchDist > PRE_PINCH;
+      const r = worldLenToGrid(state.brushR);
+      const s = field.sample(worldToGrid(hs.tip, _w));
+      if (allowed && s < r * 0.6) {
+        if (!hs.touching) { pushUndo(); hs.touching = true; }
+        applyTool('add', hs.tip);
+      } else if (s > r || !allowed) {
+        hs.touching = false;
+      }
+      showCursor(hs.cursor, hs.tip, state.brushR, MODES.add.color, allowed ? (hs.touching ? 0.4 : 0.18) : 0.06);
+    } else {
+      handSculpt(hs, dt, t);
     }
-    const s = field.sample(worldToGrid(center, _w));
-    const trigger = tool === 'carve' ? r : tool === 'add' ? r * 0.6 : r * 0.5;
-    if (allowed && s < trigger) {
-      if (!hs.touching) { pushUndo(); hs.touching = true; }
-      applyTool(tool, center, dt * 6);
-    } else if (s > trigger + r * 0.3 || !allowed) {
-      hs.touching = false;
-    }
-    showCursor(hs.cursor, center, state.brushR, tool ? MODES[tool].color : '#ffffff',
-      allowed ? (hs.touching ? 0.45 : 0.22) : 0.08);
+    rememberJoints(hs);
   }
   updateObjectManip(movers);
 }
@@ -452,7 +572,7 @@ const bw = 0.062, bh = 0.04, gap = 0.008;
 const col = (i) => (i - 1) * (bw + gap);
 const row = (j) => -j * (bh + gap);
 const panel = new ButtonPanel([
-  ...['carve', 'add', 'smooth'].map((m, i) => ({
+  ...['knead', 'add', 'smooth'].map((m, i) => ({
     id: m, label: MODES[m].label, x: col(i), y: row(0), w: bw, h: bh, color: MODES[m].color,
     onPress: () => setMode(m), isActive: () => state.mode === m,
   })),
@@ -463,7 +583,7 @@ const panel = new ButtonPanel([
   { id: 'recenter', label: '手元へ', x: col(1), y: row(2), w: bw, h: bh, onPress: recenter },
   { id: 'reset', label: 'リセット', x: col(2), y: row(2), w: bw, h: bh, onPress: resetClay },
 ], {
-  title: ['指先で触れる: 選んだ道具', 'つまむ: 粘土を引っ張る', '空中でつまむ: 移動 / 両手: 回転・拡大'],
+  title: ['手のひらで触れる: こねる / なでる', '盛る: 人差し指の先から足す', 'つまむ: 引っ張る / 空中: 移動・両手で回転'],
 });
 panel.group.position.set(-0.3, 0.02, 0.08);
 panel.group.rotation.set(-0.3, 0.6, 0, 'YXZ');
@@ -497,7 +617,7 @@ let recenterPending = false;
 let xrStartT = 0;
 
 // ---- 状態表示 (画面の UI と、XR 中は目の前の文字板) ----
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 const logLines = [];
 function log(msg) {
   const line = `${new Date().toLocaleTimeString()} ${msg}`;
@@ -568,7 +688,7 @@ async function startXR(mode) {
     renderer.xr.setReferenceSpaceType(feats && !feats.includes('local-floor') ? 'local' : 'local-floor');
     savedCam = { pos: camera.position.clone(), quat: camera.quaternion.clone(), target: controls.target.clone() };
     xrMode = mode;
-    if (state.mode === 'pull') setMode('carve');
+    if (state.mode === 'pull') setMode('knead');
     session.addEventListener('end', () => {
       log('XR を終了しました');
       xrMode = null;
@@ -650,7 +770,7 @@ setBrush(state.brushR);
 
 addEventListener('keydown', (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); undo(); return; }
-  const keys = { 1: 'carve', 2: 'add', 3: 'smooth', 4: 'pull' };
+  const keys = { 1: 'knead', 2: 'add', 3: 'smooth', 4: 'pull' };
   if (keys[e.key]) setMode(keys[e.key]);
   if (e.key === '[') setBrush(state.brushR - 0.002);
   if (e.key === ']') setBrush(state.brushR + 0.002);
