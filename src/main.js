@@ -471,10 +471,13 @@ panel.group.visible = false;
 workspace.add(panel.group);
 
 // 頭の前 (少し下) に作業台と粘土を持ってくる
+// XR 中、camera には直前に描いたフレームの頭の姿勢が入っている
 function recenter() {
-  const cam = renderer.xr.isPresenting ? renderer.xr.getCamera() : camera;
-  const head = cam.position.clone();
-  const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion);
+  recenterFrom(camera.position, camera.quaternion);
+}
+function recenterFrom(headPos, headQuat) {
+  const head = new THREE.Vector3().copy(headPos);
+  const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(headQuat);
   fwd.y = 0;
   if (fwd.lengthSq() < 1e-4) fwd.set(0, 0, -1);
   fwd.normalize();
@@ -490,7 +493,60 @@ function recenter() {
 // ================= XR セッション =================
 let xrMode = null;
 let savedCam = null;
-let recenterIn = 0;
+let recenterPending = false;
+let xrStartT = 0;
+
+// ---- 状態表示 (画面の UI と、XR 中は目の前の文字板) ----
+const VERSION = '0.2.0';
+const logLines = [];
+function log(msg) {
+  const line = `${new Date().toLocaleTimeString()} ${msg}`;
+  console.log('[clay]', msg);
+  logLines.push(line);
+  if (logLines.length > 6) logLines.shift();
+  setXRMessage(msg);
+  hud.draw();
+  hud.until = performance.now() / 1000 + 8;
+}
+const hud = (() => {
+  const canvas = document.createElement('canvas');
+  canvas.width = 1024; canvas.height = 320;
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const mesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(0.5, 0.156),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false }),
+  );
+  mesh.renderOrder = 100;
+  mesh.visible = false;
+  scene.add(mesh);
+  return {
+    mesh, until: 0,
+    draw() {
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, 1024, 320);
+      ctx.fillStyle = 'rgba(15,17,21,0.85)';
+      ctx.beginPath(); ctx.roundRect(0, 0, 1024, 320, 24); ctx.fill();
+      ctx.fillStyle = '#e8eaee';
+      ctx.font = '34px system-ui, sans-serif';
+      ctx.textBaseline = 'top';
+      ctx.fillText(`Clay XR v${VERSION}`, 24, 16);
+      logLines.forEach((l, i) => ctx.fillText(l, 24, 64 + i * 42));
+      tex.needsUpdate = true;
+    },
+    // 頭の 0.8m 前、少し下に置く
+    follow() {
+      const now = performance.now() / 1000;
+      mesh.visible = renderer.xr.isPresenting && now < this.until;
+      if (!mesh.visible) return;
+      const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+      mesh.position.copy(camera.position).addScaledVector(fwd, 0.8).add(new THREE.Vector3(0, -0.12, 0));
+      mesh.quaternion.copy(camera.quaternion);
+    },
+  };
+})();
+addEventListener('error', (e) => log(`エラー: ${e.message}`));
+addEventListener('unhandledrejection', (e) => log(`エラー: ${e.reason?.message || e.reason}`));
 
 function applyEnvironment() {
   const ar = xrMode === 'immersive-ar';
@@ -505,13 +561,16 @@ function applyEnvironment() {
 async function startXR(mode) {
   if (renderer.xr.isPresenting) return;
   try {
+    log(`${mode} を要求中…`);
     const session = await navigator.xr.requestSession(mode, { optionalFeatures: ['local-floor', 'hand-tracking'] });
     const feats = session.enabledFeatures;
+    log(`開始: 機能 = ${feats ? feats.join(', ') || 'なし' : '不明'}`);
     renderer.xr.setReferenceSpaceType(feats && !feats.includes('local-floor') ? 'local' : 'local-floor');
     savedCam = { pos: camera.position.clone(), quat: camera.quaternion.clone(), target: controls.target.clone() };
     xrMode = mode;
     if (state.mode === 'pull') setMode('carve');
     session.addEventListener('end', () => {
+      log('XR を終了しました');
       xrMode = null;
       applyEnvironment();
       for (const hs of hands) { endPinch(hs); hs.cursor.visible = false; }
@@ -524,10 +583,34 @@ async function startXR(mode) {
     });
     await renderer.xr.setSession(session);
     applyEnvironment();
-    recenterIn = 3; // 数フレーム待って頭の位置が取れてから
+    recenterPending = true; // 頭の位置が取れたフレームで手元に配置する
+    xrStartT = performance.now() / 1000;
+    for (const hs of hands) hs.reported = false;
+    log('頭の位置を待っています…');
   } catch (err) {
-    setXRMessage(`XR を開始できませんでした: ${err.message}`);
+    log(`XR を開始できませんでした: ${err.name}: ${err.message}`);
   }
+}
+
+// 頭の姿勢が取れた最初のフレームで、目の前に粘土とパネルを置く
+const _hp = new THREE.Vector3(), _hq = new THREE.Quaternion();
+function tryRecenterFromFrame(frame) {
+  const ref = renderer.xr.getReferenceSpace();
+  const pose = frame && ref ? frame.getViewerPose(ref) : null;
+  if (!pose) {
+    if (performance.now() / 1000 - xrStartT > 5) {
+      log('頭の位置が取れません。初期位置に置きます');
+      recenterPending = false;
+    }
+    return;
+  }
+  const { position: p, orientation: o } = pose.transform;
+  _hp.set(p.x, p.y, p.z);
+  _hq.set(o.x, o.y, o.z, o.w);
+  recenterFrom(_hp, _hq);
+  recenterPending = false;
+  const w = clay.position;
+  log(`配置: 頭 y=${p.y.toFixed(2)}m → 粘土 (${w.x.toFixed(2)}, ${w.y.toFixed(2)}, ${w.z.toFixed(2)})`);
 }
 
 // ================= 画面 UI =================
@@ -589,6 +672,7 @@ async function checkXR() {
   vrBtn.disabled = !vr;
   arBtn.disabled = !ar;
   if (!vr && !ar) setXRMessage('XR デバイスが見つかりません (デスクトップ操作のみ)。');
+  else setXRMessage(`対応: VR ${vr ? '○' : '×'} / パススルー ${ar ? '○' : '×'}`);
 }
 checkXR();
 
@@ -611,20 +695,31 @@ addEventListener('resize', () => {
 
 // ================= ループ =================
 let lastT = 0;
-renderer.setAnimationLoop((tms) => {
+let lastErr = '';
+renderer.setAnimationLoop((tms, frame) => {
   const t = tms / 1000;
   const dt = lastT ? Math.min(0.05, t - lastT) : 1 / 60;
   lastT = t;
-  if (renderer.xr.isPresenting) {
-    updateXR(dt, t);
-    panel.refresh();
-  } else {
-    controls.update();
+  try {
+    if (renderer.xr.isPresenting) {
+      if (recenterPending) tryRecenterFromFrame(frame);
+      for (const hs of hands) {
+        if (hs.connected && !hs.reported) { hs.reported = true; log(`手を認識: ${hs.handedness}`); }
+      }
+      updateXR(dt, t);
+      panel.refresh();
+    } else {
+      controls.update();
+    }
+    remeshDirty();
+  } catch (err) {
+    const msg = `${err.name}: ${err.message}`;
+    if (msg !== lastErr) { lastErr = msg; log(`エラー: ${msg}`); console.error(err); }
   }
-  remeshDirty();
   renderer.render(scene, camera);
-  if (recenterIn > 0 && --recenterIn === 0) recenter();
+  hud.follow();
 });
+document.getElementById('ver').textContent = `v${VERSION}`;
 
 // デバッグ用
-window.__clay = { field, clay, state, setMode, setBrush, undo, applyTool, chunkMeshes, camera, controls, hands, updateXR, panel, workspace, undoStack };
+window.__clay = { field, clay, state, setMode, setBrush, undo, applyTool, chunkMeshes, camera, controls, hands, updateXR, panel, workspace, undoStack, recenterFrom, tryRecenterFromFrame, log, hud };
