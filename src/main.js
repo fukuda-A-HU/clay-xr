@@ -2,8 +2,8 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRHandModelFactory } from 'three/addons/webxr/XRHandModelFactory.js';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
-import { ClayField } from './sdf.js?v=0.4.0';
-import { ButtonPanel } from './panel.js?v=0.4.0';
+import { ClayField } from './sdf.js?v=0.5.0';
+import { ButtonPanel } from './panel.js?v=0.5.0';
 
 // ================= 設定 =================
 const CLAY_HOME = new THREE.Vector3(0, 1.1, -0.45);
@@ -619,7 +619,7 @@ function updateXR(dt, t) {
     hs.cursor.visible = false;
 
     // ボタン
-    if (!hs.pinching && panel.press(hs.tip, hs)) {
+    if (!hs.pinching && (panel.press(hs.tip, hs) || propPanel.press(hs.tip, hs))) {
       rememberJoints(hs);
       continue;
     }
@@ -684,6 +684,60 @@ panel.group.rotation.set(-0.3, 0.6, 0, 'YXZ');
 panel.group.visible = false;
 workspace.add(panel.group);
 
+// ================= 粘土の性質 (スライダー) =================
+const pct = (v) => `${Math.round(v * 100)}%`;
+const PARAMS = [
+  { id: 'push', label: '柔らかさ', hint: '押したとき粘土が手に付いてくる割合。上げると柔らかく、下げると硬い',
+    min: 0.05, max: 0.9, get: () => VISC.push, set: (v) => { VISC.push = v; }, format: pct },
+  { id: 'pressure', label: '沈む速さ', hint: '押さえ続けたとき粘土がゆっくり沈む速さ',
+    min: 0, max: 4, get: () => LIMIT.pressure, set: (v) => { LIMIT.pressure = v; }, format: (v) => v.toFixed(1) },
+  { id: 'depth', label: '手が止まる深さ', hint: '見えている手がめり込める深さ。浅いほど硬く感じる',
+    min: 0.003, max: 0.04, get: () => LIMIT.depth, set: (v) => { LIMIT.depth = v; }, format: (v) => `${Math.round(v * 1000)}mm` },
+  { id: 'stick', label: 'くっつき', hint: '手を離すとき粘土が引っ張られる強さ',
+    min: 0, max: 0.8, get: () => VISC.stick, set: (v) => { VISC.stick = v; }, format: pct },
+  { id: 'slide', label: '引きずり', hint: '表面をなでたとき粘土が横に付いてくる割合',
+    min: 0.05, max: 0.9, get: () => VISC.slide, set: (v) => { VISC.slide = v; }, format: pct },
+  { id: 'relax', label: 'なめらかさ', hint: '手が触れた所を毎フレームならす強さ',
+    min: 0, max: 0.5, get: () => field.relax, set: (v) => { field.relax = v; }, format: (v) => `${Math.round(v * 200)}%` },
+];
+const PARAM_DEFAULTS = Object.fromEntries(PARAMS.map((p) => [p.id, p.get()]));
+const PARAM_KEY = 'clayxr.params.v1';
+let saveTimer = 0;
+function setParam(p, v) {
+  p.set(THREE.MathUtils.clamp(v, p.min, p.max));
+  syncParamInputs();
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveParams, 300);
+}
+function saveParams() {
+  try { localStorage.setItem(PARAM_KEY, JSON.stringify(Object.fromEntries(PARAMS.map((p) => [p.id, p.get()])))); } catch { /* 保存できなくても動く */ }
+}
+function loadParams() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(PARAM_KEY) || '{}');
+    for (const p of PARAMS) if (typeof saved[p.id] === 'number') p.set(THREE.MathUtils.clamp(saved[p.id], p.min, p.max));
+  } catch { /* 初期値のまま */ }
+}
+function resetParams() {
+  for (const p of PARAMS) p.set(PARAM_DEFAULTS[p.id]);
+  syncParamInputs();
+  saveParams();
+}
+
+// XR: 粘土の右側に浮かぶスライダーの板
+const sw = 0.2, sh = 0.04, sgap = 0.006;
+const propPanel = new ButtonPanel([
+  ...PARAMS.map((p, j) => ({
+    id: p.id, type: 'slider', label: p.label, x: 0, y: -j * (sh + sgap), w: sw, h: sh,
+    min: p.min, max: p.max, get: p.get, set: (v) => setParam(p, v), format: p.format,
+  })),
+  { id: 'paramReset', label: '初期値に戻す', x: 0, y: -PARAMS.length * (sh + sgap), w: sw, h: bh, onPress: resetParams },
+], { title: ['粘土の性質 (指でなぞって調整)'] });
+propPanel.group.position.set(0.3, 0.1, 0.08);
+propPanel.group.rotation.set(-0.3, -0.6, 0, 'YXZ');
+propPanel.group.visible = false;
+workspace.add(propPanel.group);
+
 // 頭の前 (少し下) に作業台と粘土を持ってくる
 // XR 中、camera には直前に描いたフレームの頭の姿勢が入っている
 function recenter() {
@@ -711,7 +765,7 @@ let recenterPending = false;
 let xrStartT = 0;
 
 // ---- 状態表示 (画面の UI と、XR 中は目の前の文字板) ----
-const VERSION = '0.4.0';
+const VERSION = '0.5.0';
 const logLines = [];
 function log(msg) {
   const line = `${new Date().toLocaleTimeString()} ${msg}`;
@@ -768,6 +822,7 @@ function applyEnvironment() {
   floor.visible = !ar;
   for (const hs of hands) { hs.offset.set(0, 0, 0); hs.s = 0; } // 手の見え方は updateHandVisuals で毎フレーム決める
   panel.group.visible = !!xrMode;
+  propPanel.group.visible = !!xrMode;
   bounds.visible = !xrMode;
   desktopCursor.visible = false;
 }
@@ -862,6 +917,32 @@ document.getElementById('ar').onclick = () => startXR('immersive-ar');
 setMode(state.mode);
 setBrush(state.brushR);
 
+// 画面: 粘土の性質のスライダー
+const paramInputs = new Map();
+for (const p of PARAMS) {
+  const row = document.createElement('label');
+  row.className = 'param';
+  row.title = p.hint;
+  row.innerHTML = `<span class="pname">${p.label}</span><input type="range"><span class="pval"></span>`;
+  const input = row.querySelector('input');
+  input.min = p.min; input.max = p.max; input.step = (p.max - p.min) / 200;
+  input.oninput = () => setParam(p, parseFloat(input.value));
+  document.getElementById('params').appendChild(row);
+  paramInputs.set(p.id, { input, val: row.querySelector('.pval') });
+}
+function syncParamInputs() {
+  for (const p of PARAMS) {
+    const el = paramInputs.get(p.id);
+    if (!el) continue;
+    const v = p.get();
+    if (document.activeElement !== el.input) el.input.value = v;
+    el.val.textContent = p.format(v);
+  }
+}
+document.getElementById('paramReset').onclick = resetParams;
+loadParams();
+syncParamInputs();
+
 addEventListener('keydown', (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); undo(); return; }
   const keys = { 1: 'knead', 2: 'add', 3: 'smooth', 4: 'pull' };
@@ -922,6 +1003,7 @@ renderer.setAnimationLoop((tms, frame) => {
       }
       updateXR(dt, t);
       panel.refresh();
+      propPanel.refresh();
     } else {
       controls.update();
     }
@@ -936,4 +1018,4 @@ renderer.setAnimationLoop((tms, frame) => {
 document.getElementById('ver').textContent = `v${VERSION}`;
 
 // デバッグ用
-window.__clay = { field, clay, state, setMode, setBrush, undo, applyTool, chunkMeshes, camera, controls, hands, updateXR, panel, workspace, undoStack, recenterFrom, tryRecenterFromFrame, log, hud, LIMIT, VISC };
+window.__clay = { field, clay, state, setMode, setBrush, undo, applyTool, chunkMeshes, camera, controls, hands, updateXR, panel, workspace, undoStack, recenterFrom, tryRecenterFromFrame, log, hud, LIMIT, VISC, PARAMS, propPanel };
